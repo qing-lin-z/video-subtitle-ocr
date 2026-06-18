@@ -1,0 +1,6 @@
+rapidocr-onnxruntime>=1.4.4
+opencv-python>=4.13.0
+numpy
+Pillow
+# GPU: pip install onnxruntime-gpu  # CUDA (NVIDIA)
+# GPU: pip install onnxruntime-directml  # DirectML (AMD/Intel)
