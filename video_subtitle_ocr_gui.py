@@ -108,7 +108,7 @@ class GpuManager:
     def create_engine(self, use_gpu: bool = True, chinese_lite: bool = False):
         """创建 RapidOCR 引擎实例（底层工厂，不缓存）"""
         from rapidocr_onnxruntime import RapidOCR
-        kwargs = {}
+        kwargs = {'use_angle_cls': True}
         if use_gpu:
             kwargs.update(self._ocr_gpu_kwargs)
         if chinese_lite:

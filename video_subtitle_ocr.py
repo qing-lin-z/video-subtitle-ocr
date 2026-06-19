@@ -300,7 +300,7 @@ class GpuManager:
         key = (use_gpu, chinese_lite)
         if key not in self._engines:
             from rapidocr_onnxruntime import RapidOCR
-            kwargs = {}
+            kwargs = {'use_angle_cls': True}
             if use_gpu and self._gpu_available:
                 kwargs.update(self._ocr_kwargs)
             if chinese_lite:
