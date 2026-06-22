@@ -7,7 +7,7 @@ Video Subtitle OCR Extractor GUI (视频字幕OCR提取工具 - 图形界面版)
 依赖: opencv-python, rapidocr-onnxruntime, onnxruntime-gpu, numpy, pillow, tkinter
 """
 
-import sys, os, re, json, time, queue, threading
+import sys, os, re, json, time, queue, threading, subprocess
 from pathlib import Path
 from datetime import timedelta
 from difflib import SequenceMatcher
@@ -838,7 +838,10 @@ class SubtitleOCRApp:
         self.video_info_label.grid(row=1, column=0, columnspan=2, sticky='w', pady=(4,0))
         self.btn_auto_detect = ttk.Button(f, text="🔍 自动框选", command=self._auto_detect_roi,
                                           state='disabled', width=10)
-        self.btn_auto_detect.grid(row=2, column=0, columnspan=2, sticky='w', pady=(4,0))
+        self.btn_auto_detect.grid(row=2, column=0, sticky='w', pady=(4,0))
+        self.btn_transcode = ttk.Button(f, text="🔄 转码 H.264", command=self._transcode_to_h264,
+                                         state='disabled', width=12)
+        self.btn_transcode.grid(row=2, column=1, sticky='e', pady=(4,0))
 
         # 参数
         f = ttk.LabelFrame(panel, text=" 识别参数 ", padding=6)
@@ -1113,8 +1116,149 @@ class SubtitleOCRApp:
         self.btn_start.configure(state='normal' if can_start else 'disabled')
         self.btn_auto_detect.configure(state='normal' if video_loaded else 'disabled')
         self.btn_play.configure(state='normal' if video_loaded else 'disabled')
+        if hasattr(self, 'btn_transcode'):
+            self.btn_transcode.configure(state='normal' if video_loaded else 'disabled')
 
     # ── 自动框选 (unchanged) ───────────────────────────
+
+    def _transcode_to_h264(self):
+        """转码为 H.264+AAC，存到缓存目录，完成后自动加载。"""
+        src = self.video_path.get()
+        if not src or not os.path.exists(src):
+            messagebox.showwarning("提示", "请先加载视频文件"); return
+        cache_dir = Path(os.environ.get('TEMP', '/tmp')) / 'video-subtitle-ocr-cache'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        src_path = Path(src)
+        dst_path = cache_dir / (src_path.stem + '_h264.mp4')
+        if dst_path.exists() and dst_path.stat().st_size > 1024:
+            if messagebox.askyesno("缓存已存在", "转码后的文件已存在:\n" + str(dst_path) + "\n\n直接使用?"):
+                self.video_path.set(str(dst_path))
+                self._load_video_info()
+                self.statusbar.configure(text="已加载缓存: " + dst_path.name)
+            return
+        ffmpeg_exe = self._find_ffmpeg()
+        if not ffmpeg_exe:
+            messagebox.showerror("未找到 ffmpeg",
+                "需要 ffmpeg 才能转码。\n\n安装方法:\n  winget install ffmpeg\n  或  choco install ffmpeg")
+            return
+        try:
+            cap = cv2.VideoCapture(src)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            duration_sec = total / fps if fps > 0 else 0
+        except Exception:
+            duration_sec = 0
+        size_mb = os.path.getsize(src) / 1024 / 1024
+        if not messagebox.askokcancel("开始转码",
+            "将转码为 H.264 + AAC 并保存到缓存:\n\n"
+            "输入: " + src_path.name + " (" + f"{size_mb:.1f}" + " MB)\n"
+            "输出: " + str(dst_path) + "\n\n"
+            "转码可能需要数分钟，完成后会自动加载。"):
+            return
+        self._tcode_win = tk.Toplevel(self.root)
+        self._tcode_win.title("转码中...")
+        self._tcode_win.geometry("480x200")
+        self._tcode_win.transient(self.root)
+        self._tcode_win.grab_set()
+        self._tcode_win.protocol("WM_DELETE_WINDOW", lambda: None)
+        ttk.Label(self._tcode_win, text="转码中，请稍候...",
+                  font=('Microsoft YaHei UI', 11, 'bold')).pack(pady=(15, 5))
+        self._tcode_label = ttk.Label(self._tcode_win, text="准备中...",
+                                      font=('', 9), foreground='#888')
+        self._tcode_label.pack(pady=(0, 5))
+        self._tcode_bar = ttk.Progressbar(self._tcode_win, mode='determinate', maximum=100)
+        self._tcode_bar.pack(padx=20, fill='x', pady=5)
+        self._tcode_status = ttk.Label(self._tcode_win, text="",
+                                       font=('', 8), foreground='#666')
+        self._tcode_status.pack(pady=(5, 10))
+        self._tcode_cancel = ttk.Button(self._tcode_win, text="取消", command=self._cancel_transcode)
+        self._tcode_cancel.pack()
+        self._tcode_proc = None
+        self._tcode_cancel_flag = threading.Event()
+        last_us_holder = [0]
+        def do_transcode():
+            cmd = [ffmpeg_exe, '-y', '-i', src,
+                   '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+                   '-c:a', 'aac', '-b:a', '128k',
+                   '-progress', 'pipe:1', '-nostats',
+                   str(dst_path)]
+            try:
+                self._tcode_proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            except FileNotFoundError as e:
+                self.root.after(0, lambda: self._on_transcode_done(None, "无法启动 ffmpeg: " + str(e)))
+                return
+            for line in self._tcode_proc.stdout:
+                line = line.decode('utf-8', errors='replace').strip()
+                if self._tcode_cancel_flag.is_set():
+                    self._tcode_proc.kill()
+                    self.root.after(0, lambda: self._on_transcode_done(None, "已取消"))
+                    return
+                if line.startswith('out_time_ms='):
+                    try:
+                        us = int(line.split('=', 1)[1])
+                        last_us_holder[0] = us
+                        if duration_sec > 0:
+                            pct = min(us / 1_000_000 / duration_sec * 100, 100)
+                            elapsed = us / 1_000_000
+                            self.root.after(0, lambda p=pct, e=elapsed: self._update_tcode_progress(
+                                p, e, duration_sec))
+                    except (ValueError, IndexError): pass
+                elif line == 'progress=end':
+                    self.root.after(0, lambda: self._update_tcode_progress(100, duration_sec, duration_sec))
+            self._tcode_proc.wait()
+            rc = self._tcode_proc.returncode
+            if rc == 0 and dst_path.exists() and dst_path.stat().st_size > 1024:
+                self.root.after(0, lambda: self._on_transcode_done(str(dst_path), None))
+            else:
+                err_bytes = self._tcode_proc.stderr.read()
+                err = err_bytes.decode('utf-8', errors='replace')
+                err_tail = err[-500:] if err else ("ffmpeg 退出码 " + str(rc))
+                self.root.after(0, lambda: self._on_transcode_done(None, err_tail))
+        threading.Thread(target=do_transcode, daemon=True).start()
+
+    def _find_ffmpeg(self):
+        import shutil
+        p = shutil.which('ffmpeg')
+        if p: return p
+        candidates = [
+            r'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
+            r'C:\ffmpeg\bin\ffmpeg.exe',
+            os.path.expandvars(r'%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe'),
+        ]
+        for c in candidates:
+            if os.path.exists(c): return c
+        return None
+
+    def _update_tcode_progress(self, pct, elapsed, total):
+        try:
+            if not self._tcode_bar.winfo_exists(): return
+        except Exception: return
+        self._tcode_bar['value'] = pct
+        self._tcode_label.configure(text=f"{pct:.1f}%   {elapsed:.1f}s / {total:.1f}s")
+        self._tcode_status.configure(text=f"输出: {pct:.1f}% 完成")
+
+    def _cancel_transcode(self):
+        self._tcode_cancel_flag.set()
+        if hasattr(self, '_tcode_proc') and self._tcode_proc:
+            try: self._tcode_proc.kill()
+            except Exception: pass
+
+    def _on_transcode_done(self, dst_path, error):
+        try:
+            if hasattr(self, '_tcode_win'):
+                self._tcode_win.destroy()
+        except Exception: pass
+        if error:
+            messagebox.showerror("转码失败", "转码失败:\n" + str(error)[:1000])
+            return
+        self.video_path.set(dst_path)
+        self._load_video_info()
+        self.statusbar.configure(text="已加载转码后视频: " + os.path.basename(dst_path))
+        messagebox.showinfo("转码完成", "转码完成！已自动加载:\n" + os.path.basename(dst_path) +
+                            "\n\n缓存位置:\n" + dst_path)
 
     def _auto_detect_roi(self):
         path = self.video_path.get()
