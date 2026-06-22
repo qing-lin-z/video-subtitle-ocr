@@ -1079,7 +1079,7 @@ class SubtitleOCRApp:
         try:
             if not self._vlc_fb.queue.empty():
                 rgba = self._vlc_fb.queue.get_nowait()
-                bgr = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+                bgr = cv2.cvtColor(rgba, cv2.COLOR_BGRA2BGR)
                 vlc_ms = self._vlc.get_time() if self._vlc else -1
                 if vlc_ms >= 0:
                     fn = int(vlc_ms / 1000.0 * self.fps)
