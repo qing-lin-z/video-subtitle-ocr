@@ -1205,7 +1205,7 @@ class SubtitleOCRApp:
         self.statusbar.configure(text="🔍 正在自动检测字幕区域...")
         self.btn_auto_detect.configure(state='disabled')
         self.btn_start.configure(state='disabled')
-        self.update_idletasks()
+        self.root.update_idletasks()
 
         # 在后台线程运行
         def do_auto_detect():
