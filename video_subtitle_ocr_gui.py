@@ -1040,6 +1040,9 @@ class SubtitleOCRApp:
     def _poll_vlc_frame(self, gen):
         if not self._playing or self._player_gen != gen or not self._vlc_fb:
             return
+        if self._vlc and self._vlc.get_state() == vlc.State.Ended:
+            self._stop_player()
+            return
         try:
             if not self._vlc_fb.queue.empty():
                 rgba = self._vlc_fb.queue.get_nowait()
