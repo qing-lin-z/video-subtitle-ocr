@@ -923,6 +923,13 @@ class SubtitleOCRApp:
         self.video_info_label.grid(row=1, column=0, columnspan=2,
                                    sticky='w', pady=(4, 0))
 
+        # ── 自动框选按钮 ──
+        self.btn_auto_detect = ttk.Button(f, text="🔍 自动框选",
+                                          command=self._auto_detect_roi,
+                                          state='disabled', width=10)
+        self.btn_auto_detect.grid(row=2, column=0, columnspan=2,
+                                  sticky='w', pady=(4, 0))
+
         # ── 参数设置 ──
         f = ttk.LabelFrame(panel, text=" 识别参数 ", padding=6)
         f.grid(row=row, column=0, sticky='ew', pady=(0, 6))
@@ -1168,8 +1175,139 @@ class SubtitleOCRApp:
     # ── 按钮状态 ─────────────────────────────────────────
 
     def _update_button_states(self):
-        can_start = bool(self.video_path.get() and self.canvas.roi is not None)
+        video_loaded = bool(self.video_path.get() and self.cap
+                           and self.cap.isOpened())
+        can_start = video_loaded and self.canvas.roi is not None
         self.btn_start.configure(state='normal' if can_start else 'disabled')
+        self.btn_auto_detect.configure(state='normal' if video_loaded else 'disabled')
+
+    # ── 自动框选 ─────────────────────────────────────────
+
+    def _auto_detect_roi(self):
+        """自动检测字幕区域并设置到 Canvas"""
+        path = self.video_path.get()
+        if not path or not os.path.exists(path):
+            messagebox.showwarning("提示", "请先选择视频文件")
+            return
+
+        if not self.cap or not self.cap.isOpened():
+            return
+
+        # 询问确认
+        ok = messagebox.askokcancel(
+            "自动框选",
+            "将自动扫描视频中的文字区域并框选字幕位置。\n\n"
+            "这可能需要 10-30 秒，是否继续？"
+        )
+        if not ok:
+            return
+
+        self.statusbar.configure(text="🔍 正在自动检测字幕区域...")
+        self.btn_auto_detect.configure(state='disabled')
+        self.btn_start.configure(state='disabled')
+        self.update_idletasks()
+
+        # 在后台线程运行
+        def do_auto_detect():
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+
+                fw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                fh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                # 采样帧
+                sample_frames = 6
+                start_ratio, end_ratio = 0.15, 0.85
+                positions = np.linspace(start_ratio, end_ratio, sample_frames)
+                frame_indices = [int(total_frames * p) for p in positions]
+
+                detector = RapidOCR(box_thresh=0.2, text_score=0.1,
+                                    use_text_det=True, use_angle_cls=False)
+
+                all_boxes = []
+                for idx, fn in enumerate(frame_indices):
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        continue
+                    dt_boxes, _ = detector.text_detector(frame)
+                    all_boxes.append(dt_boxes)
+
+                if not all_boxes:
+                    self._auto_detect_queue.put(('error',
+                        '未检测到任何文字区域，请手动框选'))
+                    return
+
+                # 筛选底部横向文字框
+                min_w = fw * 0.15
+                max_h = fh * 0.15
+                bottom_start = fh * 0.55
+                candidate_boxes = []
+                for dt_boxes in all_boxes:
+                    for box in dt_boxes:
+                        xs = box[:, 0]
+                        ys = box[:, 1]
+                        bx, by = xs.min(), ys.min()
+                        bw, bh = xs.max() - bx, ys.max() - by
+                        if (by >= bottom_start and bw >= min_w
+                                and bh <= max_h and bw / max(bh, 1) >= 2.0):
+                            candidate_boxes.append((bx, by, bw, bh))
+
+                if not candidate_boxes:
+                    self._auto_detect_queue.put(('error',
+                        '未在底部检测到字幕文字，请手动框选'))
+                    return
+
+                # 外接矩形 + 边距
+                margin = 8
+                xs = [b[0] for b in candidate_boxes]
+                ys = [b[1] for b in candidate_boxes]
+                xs2 = [b[0] + b[2] for b in candidate_boxes]
+                ys2 = [b[1] + b[3] for b in candidate_boxes]
+                x = max(0, int(np.min(xs)) - margin)
+                y = max(0, int(np.min(ys)) - margin)
+                w = min(fw - x, int(np.max(xs2)) - x + margin)
+                h = min(fh - y, int(np.max(ys2)) - y + margin)
+
+                self._auto_detect_queue.put(('ok', (x, y, w, h),
+                    len(candidate_boxes), len(all_boxes)))
+
+            except Exception as e:
+                self._auto_detect_queue.put(('error', str(e)))
+
+        self._auto_detect_queue = queue.Queue()
+        threading.Thread(target=do_auto_detect, daemon=True).start()
+        self._poll_auto_detect()
+
+    def _poll_auto_detect(self):
+        """轮询自动检测结果"""
+        try:
+            result = self._auto_detect_queue.get_nowait()
+        except queue.Empty:
+            self.after(200, self._poll_auto_detect)
+            return
+
+        status, *data = result
+        if status == 'ok':
+            roi, n_candidates, n_frames = data
+            x, y, w, h = roi
+            # 设置 Canvas ROI
+            self.canvas.roi = roi
+            self.canvas._draw_roi()
+            scale_info = ""
+            if self.canvas._scale != 1.0:
+                scale_info = f" (预览缩放 {self.canvas._scale:.2f}x)"
+            self.statusbar.configure(
+                text=f"✅ 自动框选完成: x={x} y={y} w={w} h={h}  |  "
+                     f"{n_candidates} 个候选框, 采样 {n_frames} 帧{scale_info}")
+        else:
+            msg = data[0] if data else '未知错误'
+            messagebox.showwarning("自动框选", msg)
+            self.statusbar.configure(text=f"⚠️ 自动框选失败: {msg}")
+
+        self.btn_auto_detect.configure(state='normal')
+        self._update_button_states()
 
     # ── 提取控制 ─────────────────────────────────────────
 
@@ -1190,6 +1328,7 @@ class SubtitleOCRApp:
 
         # UI 状态切换
         self.btn_start.configure(state='disabled')
+        self.btn_auto_detect.configure(state='disabled')
         self.btn_cancel.configure(state='normal')
         self.btn_save.configure(state='disabled')
         self.btn_copy.configure(state='disabled')
