@@ -849,7 +849,7 @@ class SubtitleOCRApp:
         f.columnconfigure(1, weight=1)
         params = [
             ("帧扫描间隔", self.frame_interval, 1, 60),
-            ("相似度阈值", self.similarity_threshold, 0.50, 1.00),
+            ("相似度阈值", self.similarity_threshold, 0.00, 1.00),
             ("最短持续(ms)", self.min_duration, 100, 5000),
             ("最短文本(字)", self.min_text_len, 1, 10),
         ]
