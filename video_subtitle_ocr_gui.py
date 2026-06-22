@@ -1086,9 +1086,19 @@ class SubtitleOCRApp:
                     fn = max(0, min(fn, self.total_frames - 1))
                 else:
                     fn = self.frame_position.get()
-                self._show_frame(bgr, fn)
-        except Exception:
-            pass
+                # 直接渲染到 Canvas（不经过不存在的 _show_frame）
+                self.canvas.delete('placeholder')
+                self.canvas.set_current_frame(fn)
+                self.canvas.set_frame(bgr)
+                self.frame_position.set(fn)
+                with self._frame_lock:
+                    self._current_frame = fn
+                self.frame_info.configure(
+                    text=f"帧 {fn} / {self.total_frames}  |  {frame_to_time_str(fn, self.fps)}")
+        except Exception as e:
+            # 打印异常方便调试，不再静默吞掉
+            import traceback
+            traceback.print_exc()
         self.root.after(20, lambda: self._poll_vlc_frame(gen))
 
     def _stop_player(self):
