@@ -33,7 +33,16 @@ from tkinter import ttk, filedialog, messagebox
 import cv2
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw, ImageFont
-from ffpyplayer.player import MediaPlayer
+
+# ═══ VLC DLL ═══
+def _setup_vlc(path=r'C:\Program Files\VideoLAN\VLC'):
+    if os.path.isdir(path):
+        try: os.add_dll_directory(path)
+        except Exception: pass
+        if path not in os.environ.get('PATH', ''):
+            os.environ['PATH'] = path + ';' + os.environ.get('PATH', '')
+_setup_vlc()
+import vlc
 
 # ═══════════════════════════════════════════════════════════════
 MODEL_PRESETS = {
@@ -653,10 +662,11 @@ class SubtitleOCRApp:
         self._editing = False
         self._progress_queue = queue.Queue()
 
-        # 播放器状态 (ffpyplayer 驱动音频+视频)
+        # 播放器状态 (VLC 音频 + OpenCV 帧显示 + Canvas 字幕叠加)
         self._playing = False
         self._player_thread = None
-        self._ffpy = None
+        self._player_gen = 0    # 代际计数器，防止旧线程复活
+        self._vlc = None
         self._current_frame = 0
         self._frame_lock = threading.Lock()
 
@@ -961,53 +971,59 @@ class SubtitleOCRApp:
         else: self._start_player()
 
     def _start_player(self):
-        path = self.video_path.get()
-        if not path or not os.path.exists(path): return
+        if not self.cap or not self.cap.isOpened(): return
         self._playing = True
+        self._player_gen += 1  # 换代，旧线程自动退出
         self.btn_play.configure(text="⏸ 暂停")
-        start_pts = self.frame_position.get() / max(self.fps, 1)
-        speed = self.play_speed.get()
+        # VLC 音频
+        try:
+            inst = vlc.Instance('--no-video')
+            self._vlc = inst.media_player_new()
+            media = inst.media_new(self.video_path.get())
+            self._vlc.set_media(media)
+            start_ms = int(self.frame_position.get() / max(self.fps, 1) * 1000)
+            self._vlc.play()
+            while self._vlc.get_state() == vlc.State.Opening:
+                time.sleep(0.02)
+            self._vlc.set_time(start_ms)
+            try: self._vlc.set_rate(self.play_speed.get())
+            except Exception: pass
+        except Exception as e:
+            self.statusbar.configure(text=f"⚠️ 音频初始化失败: {e}")
+        # OpenCV 帧读取
+        gen = self._player_gen
         self._player_thread = threading.Thread(
-            target=self._player_loop, args=(path, start_pts, speed), daemon=True)
+            target=lambda: self._player_loop(gen), daemon=True)
         self._player_thread.start()
 
     def _stop_player(self):
         self._playing = False
+        self._player_gen += 1  # 旧线程自毁
         self.btn_play.configure(text="▶ 播放")
-        if self._ffpy:
-            try: self._ffpy.close_player()
+        if self._vlc:
+            try: self._vlc.stop()
             except Exception: pass
-            self._ffpy = None
+            try: self._vlc.release()
+            except Exception: pass
+            self._vlc = None
 
-    def _player_loop(self, path, start_pts, speed):
-        try:
-            player = MediaPlayer(path)
-            self._ffpy = player
-            if start_pts > 0.1:
-                player.seek(start_pts, relative=False)
-            if speed != 1.0:
-                try: player.set_rate(speed)
-                except Exception: pass
-            while self._playing:
-                frame, val = player.get_frame()
-                if not self._playing:
-                    break
-                if val == 'eof':
-                    self.root.after(0, lambda: self.btn_play.configure(text="▶ 播放"))
-                    break
-                if frame is not None:
-                    img, pts = frame
-                    # img: (h,w,3) uint8 RGB → 转 BGR 给 canvas
-                    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                    fn = int(pts * self.fps)
-                    self.root.after(0, lambda f=bgr, n=fn: self._show_frame(f, n))
-        except Exception as e:
-            self.root.after(0, lambda: self.statusbar.configure(text=f"播放器错误: {e}"))
-        finally:
-            self._playing = False
-            self._ffpy = None
-            try: player.close_player()
-            except Exception: pass
+    def _player_loop(self, gen):
+        while self._playing and self._player_gen == gen and self.cap and self.cap.isOpened():
+            start = time.time()
+            ret, frame = self.cap.read()
+            if not ret:
+                self._playing = False
+                self.root.after(0, lambda: self.btn_play.configure(text="▶ 播放"))
+                if self._vlc:
+                    try: self._vlc.stop()
+                    except Exception: pass
+                break
+            fn = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            self.root.after(0, lambda f=frame, n=fn: self._show_frame(f, n))
+            target_delay = 1.0 / (self.fps * self.play_speed.get())
+            elapsed = time.time() - start
+            if elapsed < target_delay:
+                time.sleep(target_delay - elapsed)
 
     def _show_frame(self, frame, fn):
         self.canvas.set_current_frame(fn)
@@ -1017,7 +1033,10 @@ class SubtitleOCRApp:
         self.frame_info.configure(text=f"帧 {fn} / {self.total_frames}  |  {frame_to_time_str(fn, self.fps)}")
 
     def _on_speed_change(self, event=None):
-        if self._playing:
+        if self._playing and self._vlc:
+            try: self._vlc.set_rate(self.play_speed.get())
+            except Exception: pass
+        elif self._playing:
             pos = self.frame_position.get()
             self._stop_player()
             time.sleep(0.1)
@@ -1305,10 +1324,6 @@ class SubtitleOCRApp:
 
     def _on_close(self):
         self._stop_player()
-        if self._ffpy:
-            try: self._ffpy.close_player()
-            except Exception: pass
-            self._ffpy = None
         if self.worker: self.worker.cancel()
         if self.cap: self.cap.release()
         self.root.destroy()
