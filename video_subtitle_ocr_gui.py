@@ -1017,7 +1017,7 @@ class SubtitleOCRApp:
         self._vlc_fb = VlcFrameBuffer(width, height)
         # VLC 音视频统一驱动
         try:
-            inst = vlc.Instance()
+            inst = vlc.Instance('--vout=dummy', '--avcodec-hw=none', '--no-audio-time-stretch')
             self._vlc = inst.media_player_new()
             media = inst.media_new(self.video_path.get())
             self._vlc.set_media(media)
