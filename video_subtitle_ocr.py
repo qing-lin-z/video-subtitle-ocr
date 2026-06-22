@@ -261,6 +261,29 @@ def _ocr_cleanup(text: str) -> str:
     return text
 
 
+# ═══════════════════════════════════════════════════════════════
+# OCR 模型预设
+# ═══════════════════════════════════════════════════════════════
+
+MODEL_PRESETS = {
+    'PP-OCRv3': {
+        'det': 'ch_PP-OCRv3_det_infer.onnx',
+        'rec': 'ch_PP-OCRv3_rec_infer.onnx',
+        'label': 'PP-OCRv3（轻量快速)',
+    },
+    'PP-OCRv4': {
+        'det': 'ch_PP-OCRv4_det_infer.onnx',
+        'rec': 'ch_PP-OCRv4_rec_infer.onnx',
+        'label': 'PP-OCRv4（高精度)',
+    },
+    'PP-OCRv4 Server': {
+        'det': 'ch_PP-OCRv4_det_infer.onnx',
+        'rec': 'ch_PP-OCRv4_rec_server_infer.onnx',
+        'label': 'PP-OCRv4 Server（最高精度)',
+    },
+}
+DEFAULT_MODEL = 'PP-OCRv3'
+
 class GpuManager:
     """GPU 加速管理器（全局单例，缓存引擎实例）"""
     _instance = None
@@ -296,27 +319,31 @@ class GpuManager:
             return {'use_dml': True}
         return {}
 
-    def get_engine(self, use_gpu=True, chinese_lite=False):
-        key = (use_gpu, chinese_lite)
+    def get_engine(self, use_gpu=True, chinese_lite=False,
+                   model_preset=DEFAULT_MODEL):
+        key = (use_gpu, chinese_lite, model_preset)
         if key not in self._engines:
             from rapidocr_onnxruntime import RapidOCR
-            kwargs = {'use_angle_cls': True}
+            preset = MODEL_PRESETS.get(model_preset, MODEL_PRESETS[DEFAULT_MODEL])
+            kwargs = {
+                'use_angle_cls': True,
+                'det_model_path': preset['det'],
+                'rec_model_path': preset['rec'],
+            }
             if use_gpu and self._gpu_available:
                 kwargs.update(self._ocr_kwargs)
             if chinese_lite:
                 kwargs['text_score'] = 0.5
-            if kwargs:
-                self._engines[key] = RapidOCR(**kwargs)
-            else:
-                self._engines[key] = RapidOCR()
+            self._engines[key] = RapidOCR(**kwargs)
         return self._engines[key]
 
-    def warmup_async(self, on_ready=None):
+    def warmup_async(self, on_ready=None, model_preset=DEFAULT_MODEL):
         import threading
         def _warmup():
             try:
-                self.get_engine(use_gpu=True)
-                self.get_engine(use_gpu=True, chinese_lite=True)
+                self.get_engine(use_gpu=True, model_preset=model_preset)
+                self.get_engine(use_gpu=True, chinese_lite=True,
+                                model_preset=model_preset)
             except Exception:
                 pass
             if on_ready:
@@ -329,9 +356,11 @@ class OCREngine:
     """RapidOCR 封装 — 复用 GpuManager 缓存的全局引擎实例"""
 
     def __init__(self, use_gpu: bool = True, chinese_lite: bool = False,
+                 model_preset: str = DEFAULT_MODEL,
                  min_text_score: float = 0.5):
         self.use_gpu = use_gpu
         self.chinese_lite = chinese_lite
+        self.model_preset = model_preset
         self.min_text_score = min_text_score
         self._engine = None
 
@@ -339,8 +368,15 @@ class OCREngine:
         if self._engine is not None:
             return
         mgr = GpuManager.instance()
-        self._engine = mgr.get_engine(self.use_gpu, self.chinese_lite)
-        print(f"  [OK] RapidOCR 就绪 ({'GPU' if self.use_gpu else 'CPU'}{', chinese_lite' if self.chinese_lite else ''})")
+        self._engine = mgr.get_engine(self.use_gpu, self.chinese_lite,
+                                      self.model_preset)
+        label = MODEL_PRESETS.get(self.model_preset, {}).get('label', '')
+        parts = [f"{'GPU' if self.use_gpu else 'CPU'}"]
+        if self.chinese_lite:
+            parts.append('chinese_lite')
+        if label and self.model_preset != DEFAULT_MODEL:
+            parts.append(label)
+        print(f"  [OK] RapidOCR 就绪 ({', '.join(parts)})")
 
     @staticmethod
     def preprocess_all(crop, preprocess_mode="auto"):
@@ -430,6 +466,7 @@ class SubtitleExtractor:
                  min_text_len: int = 2,
                  use_gpu: bool = True,
                  chinese_lite: bool = False,
+                 model_preset: str = DEFAULT_MODEL,
                  num_workers: int = 4):
         self.video_path = video_path
         self.roi = roi
@@ -441,7 +478,7 @@ class SubtitleExtractor:
         self.min_duration_ms = min_duration_ms
         self.min_text_len = min_text_len
 
-        self.ocr = OCREngine(use_gpu, chinese_lite)
+        self.ocr = OCREngine(use_gpu, chinese_lite, model_preset)
         self.cap = None
         self.fps = 0.0
         self.total_frames = 0

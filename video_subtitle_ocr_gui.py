@@ -48,6 +48,29 @@ from difflib import SequenceMatcher
 
 
 # ═══════════════════════════════════════════════════════════════
+# OCR 模型预设
+# ═══════════════════════════════════════════════════════════════
+
+MODEL_PRESETS = {
+    'PP-OCRv3': {
+        'det': 'ch_PP-OCRv3_det_infer.onnx',
+        'rec': 'ch_PP-OCRv3_rec_infer.onnx',
+        'label': 'PP-OCRv3（轻量快速)',
+    },
+    'PP-OCRv4': {
+        'det': 'ch_PP-OCRv4_det_infer.onnx',
+        'rec': 'ch_PP-OCRv4_rec_infer.onnx',
+        'label': 'PP-OCRv4（高精度)',
+    },
+    'PP-OCRv4 Server': {
+        'det': 'ch_PP-OCRv4_det_infer.onnx',
+        'rec': 'ch_PP-OCRv4_rec_server_infer.onnx',
+        'label': 'PP-OCRv4 Server（最高精度)',
+    },
+}
+DEFAULT_MODEL = 'PP-OCRv3'
+
+# ═══════════════════════════════════════════════════════════════
 # GPU 检测与引擎管理
 # ═══════════════════════════════════════════════════════════════
 
@@ -105,10 +128,16 @@ class GpuManager:
                     det_model_path='', cls_model_path='', rec_model_path='',
                 )
 
-    def create_engine(self, use_gpu: bool = True, chinese_lite: bool = False):
+    def create_engine(self, use_gpu: bool = True, chinese_lite: bool = False,
+                      model_preset: str = DEFAULT_MODEL):
         """创建 RapidOCR 引擎实例（底层工厂，不缓存）"""
         from rapidocr_onnxruntime import RapidOCR
-        kwargs = {'use_angle_cls': True}
+        preset = MODEL_PRESETS.get(model_preset, MODEL_PRESETS[DEFAULT_MODEL])
+        kwargs = {
+            'use_angle_cls': True,
+            'det_model_path': preset['det'],
+            'rec_model_path': preset['rec'],
+        }
         if use_gpu:
             kwargs.update(self._ocr_gpu_kwargs)
         if chinese_lite:
@@ -116,23 +145,25 @@ class GpuManager:
             kwargs['use_cls'] = False
         return RapidOCR(**kwargs)
 
-    def get_engine(self, chinese_lite: bool = False):
+    def get_engine(self, chinese_lite: bool = False,
+                   model_preset: str = DEFAULT_MODEL):
         """获取缓存的 RapidOCR 引擎（若未初始化则同步加载）"""
-        cache_key = 'lite' if chinese_lite else 'full'
+        cache_key = f"{model_preset}_{'lite' if chinese_lite else 'full'}"
         if self._engines.get(cache_key) is not None:
             return self._engines[cache_key]
         with self._engine_lock:
             if self._engines.get(cache_key) is not None:
                 return self._engines[cache_key]
-            engine = self.create_engine(self.gpu_available, chinese_lite)
+            engine = self.create_engine(self.gpu_available, chinese_lite,
+                                        model_preset)
             self._engines[cache_key] = engine
             self._engine_ready = True
             return engine
 
-    def warmup_async(self, on_ready=None):
+    def warmup_async(self, on_ready=None, model_preset: str = DEFAULT_MODEL):
         """后台异步预热引擎（默认加载标准引擎），完成后回调 on_ready()"""
         def _load():
-            self.get_engine(chinese_lite=False)
+            self.get_engine(chinese_lite=False, model_preset=model_preset)
             if on_ready:
                 on_ready()
         t = threading.Thread(target=_load, daemon=True)
@@ -273,9 +304,11 @@ class OCREngine:
     """RapidOCR 封装 — 复用 GpuManager 缓存的全局引擎实例"""
 
     def __init__(self, use_gpu: bool = True, chinese_lite: bool = False,
+                 model_preset: str = DEFAULT_MODEL,
                  min_text_score: float = 0.5):
         self.use_gpu = use_gpu
         self.chinese_lite = chinese_lite
+        self.model_preset = model_preset
         self.min_text_score = min_text_score
         self._engine = None
 
@@ -283,8 +316,16 @@ class OCREngine:
         if self._engine is not None:
             return
         mgr = GpuManager.instance()
-        self._engine = mgr.get_engine(self.chinese_lite)
-        flag = ("GPU" if self.use_gpu and mgr.gpu_available else "CPU") + (', lite' if self.chinese_lite else '')
+        self._engine = mgr.get_engine(self.chinese_lite, self.model_preset)
+        label = MODEL_PRESETS.get(self.model_preset, {}).get('label', self.model_preset)
+        flag = ("GPU" if self.use_gpu and mgr.gpu_available else "CPU")
+        extra = []
+        if self.chinese_lite:
+            extra.append('lite')
+        if self.model_preset != DEFAULT_MODEL:
+            extra.append(self.model_preset)
+        if extra:
+            flag += ', ' + ', '.join(extra)
         print(f"  [OK] RapidOCR ({flag})")
 
     @staticmethod
@@ -372,6 +413,7 @@ class ExtractionWorker:
                  preprocess_mode: str, min_duration_ms: int,
                  min_text_len: int, use_gpu: bool,
                  chinese_lite: bool, num_workers: int = 4,
+                 model_preset: str = DEFAULT_MODEL,
                  progress_callback=None, done_callback=None):
         self.video_path = video_path
         self.roi = roi
@@ -382,6 +424,7 @@ class ExtractionWorker:
         self.min_text_len = min_text_len
         self.use_gpu = use_gpu
         self.chinese_lite = chinese_lite
+        self.model_preset = model_preset
         self.num_workers = max(1, num_workers)
         self.progress_cb = progress_callback
         self.done_cb = done_callback
@@ -445,7 +488,8 @@ class ExtractionWorker:
         scanned = [0]
 
         def worker():
-            engine = OCREngine(self.use_gpu, self.chinese_lite)
+            engine = OCREngine(self.use_gpu, self.chinese_lite,
+                               self.model_preset)
             engine.init()
             while True:
                 item = frame_queue.get()
@@ -926,9 +970,24 @@ class SubtitleOCRApp:
         cb_lite.grid(row=len(params) + 2, column=0, columnspan=2,
                       sticky='w', pady=(2, 0))
 
-        # 并行 worker 数量
+        # OCR 模型选择
         f = ttk.Frame(panel)
         f.grid(row=len(params) + 3, column=0, columnspan=2,
+               sticky='ew', pady=(6, 0))
+        ttk.Label(f, text="🧠 OCR 模型:").pack(side='left')
+        self.model_preset = tk.StringVar(value=DEFAULT_MODEL)
+        model_names = list(MODEL_PRESETS.keys())
+        model_labels = [MODEL_PRESETS[k]['label'] for k in model_names]
+        cb_model = ttk.Combobox(f, textvariable=self.model_preset,
+                                values=model_labels, state='readonly', width=26)
+        cb_model.current(0)
+        cb_model.pack(side='left', padx=(6, 0))
+        # 将 label 映射回 preset key
+        self._model_label_map = dict(zip(model_labels, model_names))
+
+        # 并行 worker 数量
+        f = ttk.Frame(panel)
+        f.grid(row=len(params) + 4, column=0, columnspan=2,
                sticky='ew', pady=(6, 0))
         ttk.Label(f, text="🚀 并行线程数:").pack(side='left')
         ttk.Spinbox(f, from_=1, to=8, textvariable=self.num_workers,
@@ -1149,6 +1208,8 @@ class SubtitleOCRApp:
             min_text_len=self.min_text_len.get(),
             use_gpu=self.use_gpu.get(),
             chinese_lite=self.chinese_lite.get(),
+            model_preset=self._model_label_map.get(
+                self.model_preset.get(), DEFAULT_MODEL),
             progress_callback=lambda data: self._progress_queue.put(('progress', data)),
             done_callback=lambda subs, err: self._progress_queue.put(('done', (subs, err))),
             num_workers=self.num_workers.get(),
