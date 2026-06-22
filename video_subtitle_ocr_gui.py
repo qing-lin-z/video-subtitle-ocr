@@ -975,22 +975,34 @@ class SubtitleOCRApp:
         self._playing = True
         self._player_gen += 1  # 换代，旧线程自动退出
         self.btn_play.configure(text="⏸ 暂停")
-        # VLC 音频
+        target_fn = self.frame_position.get()
+        # VLC 音频：启动 → seek 到目标位置 → 等待定位完成
         try:
             inst = vlc.Instance('--no-video')
             self._vlc = inst.media_player_new()
             media = inst.media_new(self.video_path.get())
             self._vlc.set_media(media)
-            start_ms = int(self.frame_position.get() / max(self.fps, 1) * 1000)
             self._vlc.play()
             while self._vlc.get_state() == vlc.State.Opening:
                 time.sleep(0.02)
-            self._vlc.set_time(start_ms)
+            target_ms = int(target_fn / max(self.fps, 1) * 1000)
+            self._vlc.set_time(target_ms)
             try: self._vlc.set_rate(self.play_speed.get())
             except Exception: pass
+            for _ in range(50):
+                vlc_ms = self._vlc.get_time()
+                if vlc_ms >= 0 and abs(vlc_ms - target_ms) < 500:
+                    break
+                time.sleep(0.01)
         except Exception as e:
             self.statusbar.configure(text=f"⚠️ 音频初始化失败: {e}")
-        # OpenCV 帧读取
+        # OpenCV 同步到 VLC 实际到达的位置
+        if self._vlc:
+            vlc_ms = self._vlc.get_time()
+            if vlc_ms >= 0:
+                synced_fn = int(vlc_ms / 1000.0 * self.fps)
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, synced_fn)
+                self.cap.read()
         gen = self._player_gen
         self._player_thread = threading.Thread(
             target=lambda: self._player_loop(gen), daemon=True)
@@ -1008,8 +1020,24 @@ class SubtitleOCRApp:
             self._vlc = None
 
     def _player_loop(self, gen):
-        while self._playing and self._player_gen == gen and self.cap and self.cap.isOpened():
+        last_sync = time.time()
+        SYNC_INTERVAL = 0.3   # 每 0.3 秒校准一次
+        MAX_DRIFT_FRAMES = 2  # 超过 2 帧漂移就纠正
+        while self._playing and self._player_gen == gen \
+                and self.cap and self.cap.isOpened():
             start = time.time()
+            # ── 定期与 VLC 音频时钟校准 ──
+            if self._vlc and time.time() - last_sync > SYNC_INTERVAL:
+                vlc_ms = self._vlc.get_time()
+                if vlc_ms >= 0:
+                    vlc_fn = int(vlc_ms / 1000.0 * self.fps)
+                    cur_fn = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    drift = abs(vlc_fn - cur_fn)
+                    if drift > MAX_DRIFT_FRAMES:
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, vlc_fn)
+                        self.cap.read()
+                last_sync = time.time()
+            # ── 读帧 ──
             ret, frame = self.cap.read()
             if not ret:
                 self._playing = False
