@@ -44,6 +44,33 @@ def _setup_vlc(path=r'C:\Program Files\VideoLAN\VLC'):
             os.environ['PATH'] = path + ';' + os.environ.get('PATH', '')
 _setup_vlc()
 import vlc
+import ctypes as _ctypes
+_user32 = _ctypes.windll.user32
+_EnumWindows = _user32.EnumWindows
+_EnumWindowsProc = _ctypes.WINFUNCTYPE(_ctypes.c_bool, _ctypes.c_int, _ctypes.c_int)
+_GetWindowTextW = _user32.GetWindowTextW
+_GetWindowTextLengthW = _user32.GetWindowTextLengthW
+_IsWindowVisible = _user32.IsWindowVisible
+_ShowWindow = _user32.ShowWindow
+_SW_HIDE = 0
+
+def _hide_vlc_windows():
+    """隐藏 VLC 弹出的独立视频窗口（避免和 Canvas 双画面）"""
+    hidden = []
+    def _cb(hwnd, _):
+        try:
+            length = _GetWindowTextLengthW(hwnd)
+            if length == 0: return True
+            buff = _ctypes.create_unicode_buffer(length + 1)
+            _GetWindowTextW(hwnd, buff, length + 1)
+            title = buff.value
+            if 'vlc' in title.lower() and _IsWindowVisible(hwnd):
+                _ShowWindow(hwnd, _SW_HIDE)
+                hidden.append(hwnd)
+        except Exception: pass
+        return True
+    _EnumWindows(_EnumWindowsProc(_cb), 0)
+    return hidden
 
 
 # ═══ VLC 自定义视频帧缓冲（音视频统一由 VLC 驱动）═══
@@ -1017,7 +1044,7 @@ class SubtitleOCRApp:
         self._vlc_fb = VlcFrameBuffer(width, height)
         # VLC 音视频统一驱动
         try:
-            inst = vlc.Instance('--vout=dummy', '--avcodec-hw=none', '--no-audio-time-stretch')
+            inst = vlc.Instance()  # 默认 vout 会驱动回调；'Failed to set on top' 是无害警告
             self._vlc = inst.media_player_new()
             media = inst.media_new(self.video_path.get())
             self._vlc.set_media(media)
@@ -1025,6 +1052,9 @@ class SubtitleOCRApp:
                 self._vlc_fb.lock, self._vlc_fb.unlock, self._vlc_fb.display, None)
             self._vlc.video_set_format("RV32", width, height, width * 4)
             self._vlc.play()
+            # 隐藏 VLC 默认弹出的独立视频窗口（避免双画面）
+            self.root.after(150, _hide_vlc_windows)
+            self.root.after(800, _hide_vlc_windows)
             while self._vlc.get_state() == vlc.State.Opening:
                 time.sleep(0.02)
             target_ms = int(self.frame_position.get() / max(self.fps, 1) * 1000)
