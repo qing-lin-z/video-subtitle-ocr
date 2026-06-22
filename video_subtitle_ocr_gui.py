@@ -1285,7 +1285,7 @@ class SubtitleOCRApp:
         try:
             result = self._auto_detect_queue.get_nowait()
         except queue.Empty:
-            self.after(200, self._poll_auto_detect)
+            self.root.after(200, self._poll_auto_detect)
             return
 
         status, *data = result
