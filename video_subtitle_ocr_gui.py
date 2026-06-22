@@ -33,6 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 import cv2
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw, ImageFont
+from ffpyplayer.player import MediaPlayer
 
 # ═══════════════════════════════════════════════════════════════
 MODEL_PRESETS = {
@@ -652,9 +653,10 @@ class SubtitleOCRApp:
         self._editing = False
         self._progress_queue = queue.Queue()
 
-        # 播放器状态
+        # 播放器状态 (ffpyplayer 驱动音频+视频)
         self._playing = False
         self._player_thread = None
+        self._ffpy = None
         self._current_frame = 0
         self._frame_lock = threading.Lock()
 
@@ -723,10 +725,11 @@ class SubtitleOCRApp:
         self.frame_slider.grid(row=0, column=1, sticky='ew', padx=(4, 4))
 
         ttk.Label(ctrl, text="倍速:").grid(row=0, column=2, padx=(4, 2))
-        cb = ttk.Combobox(ctrl, textvariable=self.play_speed,
+        self.speed_cb = ttk.Combobox(ctrl, textvariable=self.play_speed,
                           values=[0.5, 1.0, 1.5, 2.0], state='readonly', width=4)
-        cb.current(1)
-        cb.grid(row=0, column=3, padx=(0, 4))
+        self.speed_cb.current(1)
+        self.speed_cb.grid(row=0, column=3, padx=(0, 4))
+        self.speed_cb.bind('<<ComboboxSelected>>', self._on_speed_change)
 
         self.frame_info = ttk.Label(ctrl, text="", font=('', 8),
                                     foreground='#888', width=30, anchor='e')
@@ -934,46 +937,77 @@ class SubtitleOCRApp:
         self._seek_frame(int(float(val)))
 
     def _prev_frame(self):
+        was_playing = self._playing
         self._stop_player(); self._seek_frame(self.frame_position.get() - 1)
+        if was_playing: self._start_player()
 
     def _next_frame(self):
+        was_playing = self._playing
         self._stop_player(); self._seek_frame(self.frame_position.get() + 1)
+        if was_playing: self._start_player()
 
     def _prev_10_frames(self):
+        was_playing = self._playing
         self._stop_player(); self._seek_frame(self.frame_position.get() - 10)
+        if was_playing: self._start_player()
 
     def _next_10_frames(self):
+        was_playing = self._playing
         self._stop_player(); self._seek_frame(self.frame_position.get() + 10)
+        if was_playing: self._start_player()
 
     def _toggle_play(self):
         if self._playing: self._stop_player()
         else: self._start_player()
 
     def _start_player(self):
-        if not self.cap or not self.cap.isOpened(): return
+        path = self.video_path.get()
+        if not path or not os.path.exists(path): return
         self._playing = True
         self.btn_play.configure(text="⏸ 暂停")
-        self._player_thread = threading.Thread(target=self._player_loop, daemon=True)
+        start_pts = self.frame_position.get() / max(self.fps, 1)
+        speed = self.play_speed.get()
+        self._player_thread = threading.Thread(
+            target=self._player_loop, args=(path, start_pts, speed), daemon=True)
         self._player_thread.start()
 
     def _stop_player(self):
         self._playing = False
         self.btn_play.configure(text="▶ 播放")
+        if self._ffpy:
+            try: self._ffpy.close_player()
+            except Exception: pass
+            self._ffpy = None
 
-    def _player_loop(self):
-        while self._playing and self.cap and self.cap.isOpened():
-            start = time.time()
-            ret, frame = self.cap.read()
-            if not ret:
-                self._playing = False
-                self.root.after(0, lambda: self.btn_play.configure(text="▶ 播放"))
-                break
-            fn = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-            self.root.after(0, lambda f=frame, n=fn: self._show_frame(f, n))
-            target_delay = 1.0 / (self.fps * self.play_speed.get())
-            elapsed = time.time() - start
-            if elapsed < target_delay:
-                time.sleep(target_delay - elapsed)
+    def _player_loop(self, path, start_pts, speed):
+        try:
+            player = MediaPlayer(path)
+            self._ffpy = player
+            if start_pts > 0.1:
+                player.seek(start_pts, relative=False)
+            if speed != 1.0:
+                try: player.set_rate(speed)
+                except Exception: pass
+            while self._playing:
+                frame, val = player.get_frame()
+                if not self._playing:
+                    break
+                if val == 'eof':
+                    self.root.after(0, lambda: self.btn_play.configure(text="▶ 播放"))
+                    break
+                if frame is not None:
+                    img, pts = frame
+                    # img: (h,w,3) uint8 RGB → 转 BGR 给 canvas
+                    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    fn = int(pts * self.fps)
+                    self.root.after(0, lambda f=bgr, n=fn: self._show_frame(f, n))
+        except Exception as e:
+            self.root.after(0, lambda: self.statusbar.configure(text=f"播放器错误: {e}"))
+        finally:
+            self._playing = False
+            self._ffpy = None
+            try: player.close_player()
+            except Exception: pass
 
     def _show_frame(self, frame, fn):
         self.canvas.set_current_frame(fn)
@@ -981,6 +1015,13 @@ class SubtitleOCRApp:
         self.frame_position.set(fn)
         with self._frame_lock: self._current_frame = fn
         self.frame_info.configure(text=f"帧 {fn} / {self.total_frames}  |  {frame_to_time_str(fn, self.fps)}")
+
+    def _on_speed_change(self, event=None):
+        if self._playing:
+            pos = self.frame_position.get()
+            self._stop_player()
+            time.sleep(0.1)
+            self._start_player()
 
     # ── 按钮状态 ───────────────────────────────────────
 
@@ -1264,6 +1305,10 @@ class SubtitleOCRApp:
 
     def _on_close(self):
         self._stop_player()
+        if self._ffpy:
+            try: self._ffpy.close_player()
+            except Exception: pass
+            self._ffpy = None
         if self.worker: self.worker.cancel()
         if self.cap: self.cap.release()
         self.root.destroy()
